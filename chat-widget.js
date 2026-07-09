@@ -1,6 +1,6 @@
 (function() {
     // Configurações - O usuário deve trocar a URL após o deploy
-    const BACKEND_URL = "SUA_URL_DO_RENDER_OU_RAILWAY"; 
+    const BACKEND_URL = "https://bruckbardaro.pythonanywhere.com";
 
     // Estilos do Widget
     const styles = `
