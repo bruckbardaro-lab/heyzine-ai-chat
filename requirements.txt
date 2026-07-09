@@ -1,10 +1,6 @@
 flask
 flask-cors
-langchain
-langchain-community
-langchain-groq
-chromadb
-pypdf
+groq
 python-dotenv
-sentence-transformers
 gunicorn
+pypdf
