@@ -3,4 +3,5 @@ flask-cors
 groq
 python-dotenv
 gunicorn
-pypdf
+sentence-transformers
+numpy
