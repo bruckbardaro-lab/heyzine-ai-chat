@@ -1,15 +1,9 @@
 import os
 import json
-import sqlite3
-import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from groq import Groq
 from dotenv import load_dotenv
-import warnings
-import hashlib
-
-warnings.filterwarnings("ignore")
 
 load_dotenv()
 
@@ -20,100 +14,17 @@ CORS(app)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 client = Groq(api_key=GROQ_API_KEY)
 
-DB_PATH = "guia_embeddings.db"
-CHUNK_SIZE = 500
-OVERLAP = 50
+# Carregar o conteúdo do PDF uma única vez na memória
+def load_guia():
+    with open("guia_content.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def get_embedding(text):
-    """Obtém embedding via API do Groq."""
-    response = client.embeddings.create(
-        model="all-MiniLM-L6-v2",
-        input=text
-    )
-    return response.data[0].embedding
+GUIA_DATA = load_guia()
 
-def init_database():
-    """Inicializa o banco de dados SQLite com embeddings via API Groq."""
-    if os.path.exists(DB_PATH):
-        print(f"Banco de dados {DB_PATH} já existe. Pulando inicialização.")
-        return
+# Formata o guia para o prompt
+CONTEXTO_FULL = "\n".join([f"--- PÁGINA {p['page']} ---\n{p['text']}" for p in GUIA_DATA])
 
-    print("Inicializando banco de dados com embeddings via API Groq...")
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            page_start INTEGER NOT NULL,
-            page_end INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            embedding BLOB NOT NULL
-        )
-    """)
-
-    # Carregar chunks do JSON
-    with open("chunked_sections.json", "r", encoding="utf-8") as f:
-        chunks_data = json.load(f)
-
-    for chunk in chunks_data:
-        text = chunk["text"]
-        title = chunk["title"]
-        page_start = chunk["page_start"]
-        page_end = chunk["page_end"]
-
-        # Gerar embedding via API Groq
-        embedding = get_embedding(text)
-        embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
-
-        cursor.execute("""
-            INSERT INTO chunks (title, page_start, page_end, text, embedding)
-            VALUES (?, ?, ?, ?, ?)
-        """, (title, page_start, page_end, text, embedding_bytes))
-
-    conn.commit()
-    conn.close()
-    print(f"Banco de dados inicializado com {len(chunks_data)} chunks!")
-
-def retrieve_relevant_chunks(query, top_k=3):
-    """Busca chunks relevantes usando embeddings via Groq."""
-    query_embedding = get_embedding(query)
-    query_vector = np.array(query_embedding, dtype=np.float32)
-
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, page_start, page_end, text, embedding FROM chunks")
-    rows = cursor.fetchall()
-
-    similarities = []
-    for row in rows:
-        chunk_id, title, page_start, page_end, text, embedding_bytes = row
-        chunk_embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-        similarity = np.dot(query_vector, chunk_embedding) / (
-            np.linalg.norm(query_vector) * np.linalg.norm(chunk_embedding) + 1e-8
-        )
-        similarities.append({
-            "id": chunk_id,
-            "title": title,
-            "page_start": page_start,
-            "page_end": page_end,
-            "text": text,
-            "similarity": float(similarity)
-        })
-
-    conn.close()
-    similarities.sort(key=lambda x: x["similarity"], reverse=True)
-    return similarities[:top_k]
-
-def build_context_from_chunks(chunks):
-    context = "INFORMAÇÕES RELEVANTES DO GUIA:\n\n"
-    for chunk in chunks:
-        context += f"[Páginas {chunk['page_start']}-{chunk['page_end']}] {chunk['title']}\n"
-        context += f"{chunk['text']}\n\n"
-    return context
-
-SYSTEM_PROMPT_TEMPLATE = """Você é um assistente especializado no "Guia AN para Cães".
+SYSTEM_PROMPT = f"""Você é um assistente especializado no "Guia AN para Cães".
 Sua função é responder dúvidas baseando-se EXCLUSIVAMENTE no conteúdo do guia fornecido abaixo.
 
 REGRAS IMPORTANTES:
@@ -123,44 +34,32 @@ REGRAS IMPORTANTES:
 4. Seja educado, prestativo e direto.
 5. Responda sempre em Português do Brasil.
 
-CONTEÚDO RELEVANTE DO GUIA:
-{context}
+CONTEÚDO DO GUIA:
+{CONTEXTO_FULL}
 """
 
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.json
     user_query = data.get("query")
-
+    
     if not user_query:
         return jsonify({"error": "No query provided"}), 400
-
+    
     try:
-        relevant_chunks = retrieve_relevant_chunks(user_query, top_k=3)
-        context = build_context_from_chunks(relevant_chunks)
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=context)
-
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_query}
             ],
             model="llama-3.3-70b-versatile",
             temperature=0.1,
         )
-
+        
         answer = chat_completion.choices[0].message.content
-
+        
         return jsonify({
-            "answer": answer,
-            "sources": [
-                {
-                    "title": chunk["title"],
-                    "pages": f"{chunk['page_start']}-{chunk['page_end']}",
-                    "similarity": chunk["similarity"]
-                }
-                for chunk in relevant_chunks
-            ]
+            "answer": answer
         })
     except Exception as e:
         print(f"Erro: {e}")
@@ -168,20 +67,7 @@ def chat():
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return "Heyzine AI Chat Backend (RAG com Groq Embeddings) is running!", 200
-
-@app.route("/stats", methods=["GET"])
-def stats():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM chunks")
-    count = cursor.fetchone()[0]
-    conn.close()
-    return jsonify({
-        "total_chunks": count,
-        "db_size_mb": os.path.getsize(DB_PATH) / (1024 * 1024)
-    })
+    return "Heyzine AI Chat Backend (Ultra-Light) is running!", 200
 
 if __name__ == "__main__":
-    init_database()
     app.run(host="0.0.0.0", port=5000)
